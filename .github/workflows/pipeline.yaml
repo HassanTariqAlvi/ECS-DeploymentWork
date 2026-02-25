@@ -1,0 +1,164 @@
+name: Deploy to ECS Fargate
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: myapp
+  ECS_CLUSTER: myapp-cluster
+  ECS_SERVICE: myapp-service
+  CONTAINER_NAME: myapp
+  HEALTH_CHECK_URL: http://${{ secrets.ALB_DNS_NAME }}/health
+
+jobs:
+  deploy:
+    name: Build, Push & Deploy
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      # ─────────────────────────────────────────
+      # 1. Checkout code
+      # ─────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ─────────────────────────────────────────
+      # 2. Configure AWS credentials
+      # ─────────────────────────────────────────
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ─────────────────────────────────────────
+      # 3. Login to Amazon ECR
+      # ─────────────────────────────────────────
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ─────────────────────────────────────────
+      # 4. Build, tag, and push image to ECR
+      # ─────────────────────────────────────────
+      - name: Build, tag, and push image to ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      # ─────────────────────────────────────────
+      # 5. Snapshot current task definition
+      #    (used for rollback if health check fails)
+      # ─────────────────────────────────────────
+      - name: Get current task definition ARN (for rollback)
+        id: current-task
+        run: |
+          CURRENT_ARN=$(aws ecs describe-services \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE \
+            --query 'services[0].taskDefinition' \
+            --output text)
+          echo "arn=$CURRENT_ARN" >> $GITHUB_OUTPUT
+          echo "Current task definition: $CURRENT_ARN"
+
+      # ─────────────────────────────────────────
+      # 6. Render new task definition with new image
+      # ─────────────────────────────────────────
+      - name: Render new ECS task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ecs-task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.build-image.outputs.image }}
+
+      # ─────────────────────────────────────────
+      # 7. Deploy new task definition to ECS
+      # ─────────────────────────────────────────
+      - name: Deploy to ECS
+        id: deploy
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true   # waits for ECS to mark deployment stable
+
+      # ─────────────────────────────────────────
+      # 8. Health check via ALB
+      #    Retry for up to ~3 minutes
+      # ─────────────────────────────────────────
+      - name: Health check via ALB
+        id: health-check
+        run: |
+          echo "Waiting for ALB to route traffic to new tasks..."
+          sleep 20
+
+          MAX_RETRIES=18
+          RETRY_INTERVAL=10
+          STATUS="FAIL"
+
+          for i in $(seq 1 $MAX_RETRIES); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" $HEALTH_CHECK_URL || echo "000")
+            echo "Attempt $i/$MAX_RETRIES — HTTP $HTTP_CODE"
+
+            if [ "$HTTP_CODE" = "200" ]; then
+              STATUS="OK"
+              break
+            fi
+
+            sleep $RETRY_INTERVAL
+          done
+
+          if [ "$STATUS" = "OK" ]; then
+            echo "✅ Health check passed!"
+          else
+            echo "❌ Health check FAILED after $MAX_RETRIES attempts"
+            echo "health_status=failed" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      # ─────────────────────────────────────────
+      # 9. ROLLBACK — only runs if health check failed
+      # ─────────────────────────────────────────
+      - name: Rollback to previous task definition
+        if: failure() && steps.health-check.outputs.health_status == 'failed'
+        run: |
+          PREVIOUS_ARN="${{ steps.current-task.outputs.arn }}"
+          echo "⏪ Rolling back to: $PREVIOUS_ARN"
+
+          aws ecs update-service \
+            --cluster $ECS_CLUSTER \
+            --service $ECS_SERVICE \
+            --task-definition $PREVIOUS_ARN
+
+          echo "⏳ Waiting for rollback to stabilize..."
+          aws ecs wait services-stable \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE
+
+          echo "✅ Rollback complete."
+          exit 1   # Still fail the pipeline so the push is marked red
+
+      # ─────────────────────────────────────────
+      # 10. Summary
+      # ─────────────────────────────────────────
+      - name: Deployment summary
+        if: success()
+        run: |
+          echo "🚀 Deployment successful!"
+          echo "Image: ${{ steps.build-image.outputs.image }}"
+          echo "Cluster: $ECS_CLUSTER"
+          echo "Service: $ECS_SERVICE"
