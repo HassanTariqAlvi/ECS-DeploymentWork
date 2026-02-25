@@ -1,0 +1,357 @@
+# AWS Setup Guide — ECS Fargate + ALB + VPC
+# All steps use AWS CLI or Console. No Terraform.
+# Replace ACCOUNT_ID, YOUR_DOMAIN, etc. with your real values.
+
+# ══════════════════════════════════════════
+# STEP 1 — VPC & NETWORKING
+# ══════════════════════════════════════════
+
+# 1.1 Create VPC
+VPC_ID=$(aws ec2 create-vpc \
+  --cidr-block 10.0.0.0/16 \
+  --tag-specifications 'ResourceType=vpc,Tags=[{Key=Name,Value=myapp-vpc}]' \
+  --query 'Vpc.VpcId' --output text)
+echo "VPC: $VPC_ID"
+
+# Enable DNS hostnames (required for ECS + ECR)
+aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-hostnames
+aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-support
+
+# 1.2 Internet Gateway (for public subnets)
+IGW_ID=$(aws ec2 create-internet-gateway \
+  --tag-specifications 'ResourceType=internet-gateway,Tags=[{Key=Name,Value=myapp-igw}]' \
+  --query 'InternetGateway.InternetGatewayId' --output text)
+aws ec2 attach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $VPC_ID
+echo "IGW: $IGW_ID"
+
+# 1.3 Public Subnets (ALB lives here — 2 AZs for high availability)
+PUB_SUBNET_1=$(aws ec2 create-subnet \
+  --vpc-id $VPC_ID --cidr-block 10.0.1.0/24 \
+  --availability-zone us-east-1a \
+  --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value=myapp-public-1a}]' \
+  --query 'Subnet.SubnetId' --output text)
+
+PUB_SUBNET_2=$(aws ec2 create-subnet \
+  --vpc-id $VPC_ID --cidr-block 10.0.2.0/24 \
+  --availability-zone us-east-1b \
+  --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value=myapp-public-1b}]' \
+  --query 'Subnet.SubnetId' --output text)
+
+echo "Public subnets: $PUB_SUBNET_1  $PUB_SUBNET_2"
+
+# 1.4 Private Subnets (ECS tasks live here)
+PRIV_SUBNET_1=$(aws ec2 create-subnet \
+  --vpc-id $VPC_ID --cidr-block 10.0.10.0/24 \
+  --availability-zone us-east-1a \
+  --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value=myapp-private-1a}]' \
+  --query 'Subnet.SubnetId' --output text)
+
+PRIV_SUBNET_2=$(aws ec2 create-subnet \
+  --vpc-id $VPC_ID --cidr-block 10.0.11.0/24 \
+  --availability-zone us-east-1b \
+  --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value=myapp-private-1b}]' \
+  --query 'Subnet.SubnetId' --output text)
+
+echo "Private subnets: $PRIV_SUBNET_1  $PRIV_SUBNET_2"
+
+# 1.5 Public Route Table → Internet Gateway
+PUB_RT=$(aws ec2 create-route-table --vpc-id $VPC_ID \
+  --tag-specifications 'ResourceType=route-table,Tags=[{Key=Name,Value=myapp-public-rt}]' \
+  --query 'RouteTable.RouteTableId' --output text)
+
+aws ec2 create-route --route-table-id $PUB_RT \
+  --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW_ID
+
+aws ec2 associate-route-table --route-table-id $PUB_RT --subnet-id $PUB_SUBNET_1
+aws ec2 associate-route-table --route-table-id $PUB_RT --subnet-id $PUB_SUBNET_2
+
+# 1.6 NAT Gateway (so private ECS tasks can pull from ECR)
+EIP=$(aws ec2 allocate-address --domain vpc \
+  --query 'AllocationId' --output text)
+
+NAT_GW=$(aws ec2 create-nat-gateway \
+  --subnet-id $PUB_SUBNET_1 \
+  --allocation-id $EIP \
+  --tag-specifications 'ResourceType=natgateway,Tags=[{Key=Name,Value=myapp-nat}]' \
+  --query 'NatGateway.NatGatewayId' --output text)
+
+echo "Waiting for NAT Gateway to be available..."
+aws ec2 wait nat-gateway-available --nat-gateway-ids $NAT_GW
+echo "NAT: $NAT_GW"
+
+# 1.7 Private Route Table → NAT Gateway
+PRIV_RT=$(aws ec2 create-route-table --vpc-id $VPC_ID \
+  --tag-specifications 'ResourceType=route-table,Tags=[{Key=Name,Value=myapp-private-rt}]' \
+  --query 'RouteTable.RouteTableId' --output text)
+
+aws ec2 create-route --route-table-id $PRIV_RT \
+  --destination-cidr-block 0.0.0.0/0 --nat-gateway-id $NAT_GW
+
+aws ec2 associate-route-table --route-table-id $PRIV_RT --subnet-id $PRIV_SUBNET_1
+aws ec2 associate-route-table --route-table-id $PRIV_RT --subnet-id $PRIV_SUBNET_2
+
+
+# ══════════════════════════════════════════
+# STEP 2 — SECURITY GROUPS
+# ══════════════════════════════════════════
+
+# 2.1 ALB Security Group (accepts public HTTP/HTTPS)
+ALB_SG=$(aws ec2 create-security-group \
+  --group-name myapp-alb-sg \
+  --description "ALB - allow HTTP and HTTPS from internet" \
+  --vpc-id $VPC_ID \
+  --query 'GroupId' --output text)
+
+aws ec2 authorize-security-group-ingress --group-id $ALB_SG \
+  --protocol tcp --port 80 --cidr 0.0.0.0/0
+aws ec2 authorize-security-group-ingress --group-id $ALB_SG \
+  --protocol tcp --port 443 --cidr 0.0.0.0/0
+
+echo "ALB SG: $ALB_SG"
+
+# 2.2 ECS Task Security Group (only accepts traffic FROM the ALB)
+ECS_SG=$(aws ec2 create-security-group \
+  --group-name myapp-ecs-sg \
+  --description "ECS tasks - allow traffic from ALB only" \
+  --vpc-id $VPC_ID \
+  --query 'GroupId' --output text)
+
+aws ec2 authorize-security-group-ingress --group-id $ECS_SG \
+  --protocol tcp --port 8000 --source-group $ALB_SG
+
+echo "ECS SG: $ECS_SG"
+
+
+# ══════════════════════════════════════════
+# STEP 3 — ECR REPOSITORY
+# ══════════════════════════════════════════
+
+aws ecr create-repository \
+  --repository-name myapp \
+  --image-scanning-configuration scanOnPush=true \
+  --region us-east-1
+
+# Get your ECR URI:
+ECR_URI=$(aws ecr describe-repositories \
+  --repository-names myapp \
+  --query 'repositories[0].repositoryUri' --output text)
+echo "ECR URI: $ECR_URI"
+
+
+# ══════════════════════════════════════════
+# STEP 4 — IAM ROLES
+# ══════════════════════════════════════════
+
+# 4.1 ECS Task Execution Role (used by ECS agent to pull image + push logs)
+aws iam create-role \
+  --role-name ecsTaskExecutionRole \
+  --assume-role-policy-document '{
+    "Version":"2012-10-17",
+    "Statement":[{
+      "Effect":"Allow",
+      "Principal":{"Service":"ecs-tasks.amazonaws.com"},
+      "Action":"sts:AssumeRole"
+    }]
+  }'
+
+aws iam attach-role-policy \
+  --role-name ecsTaskExecutionRole \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+# 4.2 ECS Task Role (for app code to call other AWS services — extend as needed)
+aws iam create-role \
+  --role-name ecsTaskRole \
+  --assume-role-policy-document '{
+    "Version":"2012-10-17",
+    "Statement":[{
+      "Effect":"Allow",
+      "Principal":{"Service":"ecs-tasks.amazonaws.com"},
+      "Action":"sts:AssumeRole"
+    }]
+  }'
+
+
+# ══════════════════════════════════════════
+# STEP 5 — CLOUDWATCH LOG GROUP
+# ══════════════════════════════════════════
+
+aws logs create-log-group \
+  --log-group-name /ecs/myapp \
+  --region us-east-1
+
+
+# ══════════════════════════════════════════
+# STEP 6 — ECS CLUSTER
+# ══════════════════════════════════════════
+
+aws ecs create-cluster \
+  --cluster-name myapp-cluster \
+  --capacity-providers FARGATE FARGATE_SPOT \
+  --default-capacity-provider-strategy \
+    capacityProvider=FARGATE,weight=1
+
+
+# ══════════════════════════════════════════
+# STEP 7 — REGISTER TASK DEFINITION
+# (update ACCOUNT_ID in ecs-task-definition.json first!)
+# ══════════════════════════════════════════
+
+# Replace placeholder with real account ID
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+sed -i "s/ACCOUNT_ID/$ACCOUNT_ID/g" ecs-task-definition.json
+
+aws ecs register-task-definition \
+  --cli-input-json file://ecs-task-definition.json
+
+
+# ══════════════════════════════════════════
+# STEP 8 — APPLICATION LOAD BALANCER
+# ══════════════════════════════════════════
+
+# 8.1 Create ALB
+ALB_ARN=$(aws elbv2 create-load-balancer \
+  --name myapp-alb \
+  --subnets $PUB_SUBNET_1 $PUB_SUBNET_2 \
+  --security-groups $ALB_SG \
+  --scheme internet-facing \
+  --type application \
+  --ip-address-type ipv4 \
+  --query 'LoadBalancers[0].LoadBalancerArn' --output text)
+echo "ALB ARN: $ALB_ARN"
+
+# 8.2 Create Target Group (points to ECS tasks on port 8000)
+TG_ARN=$(aws elbv2 create-target-group \
+  --name myapp-tg \
+  --protocol HTTP \
+  --port 8000 \
+  --vpc-id $VPC_ID \
+  --target-type ip \
+  --health-check-path /health \
+  --health-check-interval-seconds 30 \
+  --health-check-timeout-seconds 5 \
+  --healthy-threshold-count 2 \
+  --unhealthy-threshold-count 3 \
+  --matcher HttpCode=200 \
+  --query 'TargetGroups[0].TargetGroupArn' --output text)
+echo "Target Group ARN: $TG_ARN"
+
+# 8.3 HTTP Listener (redirects to HTTPS once cert is set up)
+aws elbv2 create-listener \
+  --load-balancer-arn $ALB_ARN \
+  --protocol HTTP \
+  --port 80 \
+  --default-actions Type=redirect,RedirectConfig='{Protocol=HTTPS,Port=443,StatusCode=HTTP_301}'
+
+# 8.4 Get ALB DNS name (you'll need this for GitHub secret + Route 53)
+ALB_DNS=$(aws elbv2 describe-load-balancers \
+  --load-balancer-arns $ALB_ARN \
+  --query 'LoadBalancers[0].DNSName' --output text)
+echo "ALB DNS: $ALB_DNS"
+echo "→ Add this as GitHub Secret: ALB_DNS_NAME"
+
+
+# ══════════════════════════════════════════
+# STEP 9 — ECS SERVICE
+# ══════════════════════════════════════════
+
+aws ecs create-service \
+  --cluster myapp-cluster \
+  --service-name myapp-service \
+  --task-definition myapp \
+  --desired-count 2 \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={
+    subnets=[$PRIV_SUBNET_1,$PRIV_SUBNET_2],
+    securityGroups=[$ECS_SG],
+    assignPublicIp=DISABLED
+  }" \
+  --load-balancers "targetGroupArn=$TG_ARN,containerName=myapp,containerPort=8000" \
+  --deployment-configuration \
+    "minimumHealthyPercent=100,maximumPercent=200" \
+  --health-check-grace-period-seconds 30
+
+
+# ══════════════════════════════════════════
+# STEP 10 — HTTPS + ACM CERTIFICATE
+# (do this after pointing domain to ALB)
+# ══════════════════════════════════════════
+
+# 10.1 Request certificate (replace with your domain)
+CERT_ARN=$(aws acm request-certificate \
+  --domain-name "api.yourdomain.com" \
+  --subject-alternative-names "*.yourdomain.com" \
+  --validation-method DNS \
+  --query 'CertificateArn' --output text)
+echo "Certificate ARN: $CERT_ARN"
+echo "→ Go to ACM Console and add the CNAME records to Route 53 to validate"
+
+# 10.2 After certificate is ISSUED, add HTTPS listener to ALB
+aws elbv2 create-listener \
+  --load-balancer-arn $ALB_ARN \
+  --protocol HTTPS \
+  --port 443 \
+  --ssl-policy ELBSecurityPolicy-TLS13-1-2-2021-06 \
+  --certificates CertificateArn=$CERT_ARN \
+  --default-actions Type=forward,TargetGroupArn=$TG_ARN
+
+
+# ══════════════════════════════════════════
+# STEP 11 — ROUTE 53 — POINT DOMAIN TO ALB
+# ══════════════════════════════════════════
+
+# Get your hosted zone ID
+HOSTED_ZONE_ID=$(aws route53 list-hosted-zones \
+  --query "HostedZones[?Name=='yourdomain.com.'].Id" \
+  --output text | cut -d'/' -f3)
+
+ALB_HOSTED_ZONE=$(aws elbv2 describe-load-balancers \
+  --load-balancer-arns $ALB_ARN \
+  --query 'LoadBalancers[0].CanonicalHostedZoneId' --output text)
+
+# Create A record alias
+aws route53 change-resource-record-sets \
+  --hosted-zone-id $HOSTED_ZONE_ID \
+  --change-batch "{
+    \"Changes\": [{
+      \"Action\": \"CREATE\",
+      \"ResourceRecordSet\": {
+        \"Name\": \"api.yourdomain.com\",
+        \"Type\": \"A\",
+        \"AliasTarget\": {
+          \"HostedZoneId\": \"$ALB_HOSTED_ZONE\",
+          \"DNSName\": \"$ALB_DNS\",
+          \"EvaluateTargetHealth\": true
+        }
+      }
+    }]
+  }"
+
+
+# ══════════════════════════════════════════
+# STEP 12 — GITHUB SECRETS
+# Add these in: Settings → Secrets → Actions
+# ══════════════════════════════════════════
+
+# AWS_ACCESS_KEY_ID       → your IAM user access key
+# AWS_SECRET_ACCESS_KEY   → your IAM user secret key
+# ALB_DNS_NAME            → the ALB_DNS value from step 8.4
+
+# ══════════════════════════════════════════
+# ARCHITECTURE DIAGRAM
+# ══════════════════════════════════════════
+#
+#   Internet
+#      │
+#   Route 53 (your domain → ALB alias)
+#      │
+#   ALB (public subnets: 1a + 1b)
+#   ├── HTTP :80  → redirect to HTTPS
+#   └── HTTPS :443 → Target Group
+#                       │
+#              ┌────────┴────────┐
+#          ECS Task          ECS Task
+#       (private 1a)      (private 1b)
+#       FastAPI :8000     FastAPI :8000
+#              │                 │
+#           NAT GW → Internet (ECR, CloudWatch)
+#
