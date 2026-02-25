@@ -111,6 +111,8 @@ jobs:
           STATUS="FAIL"
 
           for i in $(seq 1 $MAX_RETRIES); do
+            echo "Testing URL: $HEALTH_CHECK_URL"
+            curl -v $HEALTH_CHECK_URL 2>&1 | head -30
             HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" $HEALTH_CHECK_URL || echo "000")
             echo "Attempt $i/$MAX_RETRIES — HTTP $HTTP_CODE"
 
