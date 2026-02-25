@@ -11,7 +11,7 @@ env:
   ECS_CLUSTER: myapp-cluster
   ECS_SERVICE: myapp-service
   CONTAINER_NAME: myapp
-  HEALTH_CHECK_URL: http://${{ secrets.ALB_DNS_NAME }}/health
+  HEALTH_CHECK_URL: https://fastapi.razesteer.com/health
 
 jobs:
   deploy:
